@@ -3,11 +3,14 @@ import re
 import pandas as pd
 import streamlit as st
 import nltk
-from nltk.corpus import stopwords
-from nltk.sentiment import SentimentIntensityAnalyzer
-from dotenv import load_dotenv
 import praw
 from datetime import datetime
+from dotenv import load_dotenv
+
+from nltk.corpus import stopwords
+from nltk.sentiment import SentimentIntensityAnalyzer
+
+from transformers import pipeline
 
 load_dotenv()
 
@@ -21,8 +24,20 @@ if not CLIENT_ID or not CLIENT_SECRET or not USER_AGENT:
 
 nltk.download("stopwords", quiet=True)
 nltk.download("vader_lexicon", quiet=True)
+
 STOP_WORDS = set(stopwords.words("english"))
 SIA = SentimentIntensityAnalyzer()
+
+sentiment_model = pipeline(
+    "sentiment-analysis",
+    model="distilbert-base-uncased-finetuned-sst-2-english"
+)
+
+ner_model = pipeline(
+    "ner",
+    model="dbmdz/bert-large-cased-finetuned-conll03-english",
+    aggregation_strategy="simple"
+)
 
 def clean_text(text):
     if not isinstance(text, str):
@@ -30,10 +45,11 @@ def clean_text(text):
     text = text.lower()
     text = re.sub(r"http\S+", "", text)
     text = re.sub(r"[^a-zA-Z ]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
     tokens = [w for w in text.split() if w not in STOP_WORDS]
     return " ".join(tokens)
 
-def classify_sentiment(text):
+def vader_sentiment(text):
     score = SIA.polarity_scores(text)["compound"]
     if score > 0.05:
         return "Positive"
@@ -41,14 +57,22 @@ def classify_sentiment(text):
         return "Negative"
     return "Neutral"
 
-def color_sentiment(val):
-    return {
-        "Positive": "color:green",
-        "Negative": "color:red",
-        "Neutral": "color:orange"
-    }.get(val, "")
+def bert_sentiment(text):
+    try:
+        result = sentiment_model(text[:512])[0]
+        label = result["label"]
+        return "Positive" if label == "POSITIVE" else "Negative"
+    except:
+        return "Neutral"
 
-def fetch_reddit_data(subreddits, limit):
+def extract_entities(text):
+    try:
+        entities = ner_model(text[:512])
+        return ", ".join(set([e["word"] for e in entities]))
+    except:
+        return ""
+
+def fetch_reddit_data(subreddits, limit, model_choice):
     reddit = praw.Reddit(
         client_id=CLIENT_ID,
         client_secret=CLIENT_SECRET,
@@ -56,57 +80,87 @@ def fetch_reddit_data(subreddits, limit):
     )
 
     rows = []
+
     for sub in subreddits:
         subreddit = reddit.subreddit(sub.strip())
+
         for post in subreddit.hot(limit=limit):
-            cleaned = clean_text(post.title)
+            raw_text = f"{post.title} {post.selftext}"
+            cleaned = clean_text(raw_text)
+
             post_link = f"https://www.reddit.com{post.permalink}"
             title_html = f'<a href="{post_link}" target="_blank">{post.title}</a>'
+
+            if model_choice == "VADER":
+                sentiment = vader_sentiment(cleaned)
+            else:
+                sentiment = bert_sentiment(cleaned)
+
+            entities = extract_entities(raw_text)
+
             rows.append({
                 "Subreddit": sub,
                 "Title": title_html,
                 "Cleaned Text": cleaned,
-                "Sentiment": classify_sentiment(cleaned),
+                "Sentiment": sentiment,
+                "Entities (NER)": entities,
                 "Author": str(post.author),
                 "Upvotes": post.score,
                 "Comments": post.num_comments,
                 "Timestamp": datetime.utcfromtimestamp(post.created_utc),
-                "Link": post_link  
+                "Link": post_link
             })
+
     return pd.DataFrame(rows)
 
-st.set_page_config(page_title="Reddit Sentiment Analyzer", layout="wide")
-st.title("📊 Reddit Sentiment Analyzer")
+st.set_page_config(page_title="Reddit-Pulse AI Analyzer", layout="wide")
 
-st.markdown("""
-Enter subreddit names (comma-separated) and select how many posts to fetch per subreddit.
-""")
+st.title("📊 Reddit-Pulse – AI Sentiment Analyzer")
+st.markdown("Real-time Reddit sentiment analysis using **VADER + BERT + NER (Hugging Face)**")
 
-subs_input = st.text_input("Subreddits:", "technology,AskReddit")
+subs_input = st.text_input("Subreddits (comma-separated):", "technology,AskReddit")
 post_limit = st.slider("Posts per subreddit:", 5, 50, 20)
 
+model_choice = st.radio(
+    "Select Sentiment Model:",
+    ["VADER", "BERT (Hugging Face)"]
+)
+
 if st.button("🚀 Run Analysis"):
-    subreddits = [s.strip() for s in subs_input.split(",")]
-    
+
+    subreddits = [s.strip() for s in subs_input.split(",") if s.strip()]
+
     if not subreddits:
         st.warning("Please enter at least one subreddit.")
-    else:
-        with st.spinner("Fetching and analyzing Reddit posts..."):
-            df = fetch_reddit_data(subreddits, post_limit)
+        st.stop()
 
-        st.success(f"✅ Analysis complete! Fetched {len(df)} posts.")
+    with st.spinner("Fetching Reddit data + running AI models..."):
+        df = fetch_reddit_data(subreddits, post_limit, model_choice)
 
-        st.write(
-            df[['Subreddit','Title','Cleaned Text','Sentiment','Author','Upvotes','Comments','Timestamp']].to_html(escape=False, index=False),
-            unsafe_allow_html=True
-        )
+    st.success(f"✅ Done! Fetched {len(df)} posts")
 
-        csv_df = df.copy()
-        csv_df['Title'] = csv_df['Title'].str.replace(r"<.*?>", "", regex=True)
-        csv = csv_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="⬇️ Download CSV",
-            data=csv,
-            file_name="reddit_sentiment.csv",
-            mime="text/csv"
-        )
+    st.write(
+        df[[
+            "Subreddit",
+            "Title",
+            "Sentiment",
+            "Entities (NER)",
+            "Author",
+            "Upvotes",
+            "Comments",
+            "Timestamp"
+        ]].to_html(escape=False, index=False),
+        unsafe_allow_html=True
+    )
+
+    csv_df = df.copy()
+    csv_df["Title"] = csv_df["Title"].str.replace(r"<.*?>", "", regex=True)
+
+    csv = csv_df.to_csv(index=False).encode("utf-8")
+
+    st.download_button(
+        label="⬇️ Download CSV Report",
+        data=csv,
+        file_name="reddit_pulse_ai_sentiment.csv",
+        mime="text/csv"
+    )
