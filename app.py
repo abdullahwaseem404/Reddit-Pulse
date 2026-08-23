@@ -4,13 +4,17 @@ import pandas as pd
 import streamlit as st
 import nltk
 import praw
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
+
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
 from nltk.corpus import stopwords
 from nltk.sentiment import SentimentIntensityAnalyzer
+from transformers import pipeline, logging as hf_logging
 
-from transformers import pipeline
+hf_logging.set_verbosity_error()
 
 load_dotenv()
 
@@ -22,22 +26,32 @@ if not CLIENT_ID or not CLIENT_SECRET or not USER_AGENT:
     st.error("❌ Reddit API credentials missing in .env")
     st.stop()
 
-nltk.download("stopwords", quiet=True)
-nltk.download("vader_lexicon", quiet=True)
+@st.cache_resource
+def setup_nltk():
+    nltk.download("stopwords", quiet=True)
+    nltk.download("vader_lexicon", quiet=True)
+
+setup_nltk()
 
 STOP_WORDS = set(stopwords.words("english"))
 SIA = SentimentIntensityAnalyzer()
 
-sentiment_model = pipeline(
-    "sentiment-analysis",
-    model="distilbert-base-uncased-finetuned-sst-2-english"
-)
+@st.cache_resource
+def load_hf_pipelines():
+    sentiment = pipeline(
+        "sentiment-analysis",
+        model="distilbert-base-uncased-finetuned-sst-2-english",
+        framework="pt"
+    )
+    ner = pipeline(
+        "ner",
+        model="dbmdz/bert-large-cased-finetuned-conll03-english",
+        aggregation_strategy="simple",
+        framework="pt"
+    )
+    return sentiment, ner
 
-ner_model = pipeline(
-    "ner",
-    model="dbmdz/bert-large-cased-finetuned-conll03-english",
-    aggregation_strategy="simple"
-)
+sentiment_model, ner_model = load_hf_pipelines()
 
 def clean_text(text):
     if not isinstance(text, str):
@@ -62,14 +76,14 @@ def bert_sentiment(text):
         result = sentiment_model(text[:512])[0]
         label = result["label"]
         return "Positive" if label == "POSITIVE" else "Negative"
-    except:
+    except Exception:
         return "Neutral"
 
 def extract_entities(text):
     try:
         entities = ner_model(text[:512])
         return ", ".join(set([e["word"] for e in entities]))
-    except:
+    except Exception:
         return ""
 
 def fetch_reddit_data(subreddits, limit, model_choice):
@@ -107,7 +121,7 @@ def fetch_reddit_data(subreddits, limit, model_choice):
                 "Author": str(post.author),
                 "Upvotes": post.score,
                 "Comments": post.num_comments,
-                "Timestamp": datetime.utcfromtimestamp(post.created_utc),
+                "Timestamp": datetime.fromtimestamp(post.created_utc, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
                 "Link": post_link
             })
 
@@ -127,7 +141,6 @@ model_choice = st.radio(
 )
 
 if st.button("🚀 Run Analysis"):
-
     subreddits = [s.strip() for s in subs_input.split(",") if s.strip()]
 
     if not subreddits:

@@ -1,7 +1,7 @@
+streamlit
 praw
 pandas
 nltk
-streamlit
 python-dotenv
 transformers
 torch
